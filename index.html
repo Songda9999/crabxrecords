@@ -145,10 +145,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
   // Patterns
   const titlePattern = /在线交谈开始于\s(.*)|Conversation with (\d+)/;
-  // 支持英文冒号 ":" + 中文冒号 "："
   const messageStartPattern = /^\s*(\(\d{2}:\d{2}:\d{2}\))\s(.*?)\s*[:：]\s([\s\S]*)/;
   const systemMessagePattern = /^\s*(\(\d{2}:\d{2}:\d{2}\))\s\*\*\*(.*)\*\*\*/;
-  const attachmentLinePattern = /^(.*uploaded:)(.*)\.png/;
+
+  // ✅ 更通用：识别“已上传 / uploaded”
+  const uploadedKeywordRe = /(已上传|uploaded)\s*[:：]?/i;
 
   function renderText(text, type) {
     if (!text || text.trim() === '') return;
@@ -172,7 +173,6 @@ document.addEventListener('DOMContentLoaded', function () {
     chatLog.appendChild(messageDiv);
   }
 
-  // ===== Metrics helpers =====
   function hhmmssToSeconds(hhmmss) {
     const m = hhmmss.match(/^(\d{2}):(\d{2}):(\d{2})$/);
     if (!m) return null;
@@ -182,15 +182,15 @@ document.addEventListener('DOMContentLoaded', function () {
     return h * 3600 + mi * 60 + s;
   }
 
+  // ✅ 避免 01:52 被显示成 01:53
   function formatSecondsToHHMMSS(totalSeconds) {
-    const sec = Math.max(0, Math.round(totalSeconds));
+    const sec = Math.max(0, Math.floor(totalSeconds));
     const h = String(Math.floor(sec / 3600)).padStart(2, '0');
     const m = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
     const s = String(sec % 60).padStart(2, '0');
     return `${h}:${m}:${s}`;
   }
 
-  // 用户识别（按你的票据表现）
   function isUserSpeaker(speaker) {
     const sp = (speaker || '').toLowerCase().trim();
     return (
@@ -203,21 +203,33 @@ document.addEventListener('DOMContentLoaded', function () {
     );
   }
 
-  // 系统过滤（只过滤 CrabX）
   function isSystemOrBotSpeaker(speaker) {
     const sp = (speaker || '').toLowerCase().trim();
     return sp === 'crabx';
   }
 
-  // 解析 plain_body 里的 (HH:MM:SS) 说话人: 内容
+  // ✅ 识别“正在为您连接客服/转接”的系统文本（作为起点）
+  function isTransferText(text) {
+    const t = (text || '').toLowerCase();
+    return (
+      t.includes('正在为您连接客服') ||
+      t.includes('正在为您連接客服') ||
+      t.includes('正在为您转接') ||
+      t.includes('正在為您轉接') ||
+      t.includes('connecting you to') ||
+      t.includes('connecting to an agent') ||
+      t.includes('connecting you with')
+    );
+  }
+
+  // ✅ 解析 plain_body：把“已上传/uploaded”也当成用户消息（文件名在下一行也兼容）
   function parseEventsFromPlainBody(fullText) {
     const events = [];
     const lines = fullText.split('\n');
-
-    // 同时支持 ":" 和 "："
     const lineRe = /^\s*\((\d{2}:\d{2}:\d{2})\)\s*(.+?)\s*[:：]\s*(.*)$/;
 
-    for (const raw of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i];
       const line = raw.trim();
       const m = line.match(lineRe);
       if (!m) continue;
@@ -226,7 +238,25 @@ document.addEventListener('DOMContentLoaded', function () {
       if (tSec === null) continue;
 
       const speaker = (m[2] || '').trim();
-      const text = (m[3] || '').trim();
+      let text = (m[3] || '').trim();
+
+      // 如果是用户的“已上传”，但这一行没带文件名，就把下一行文件名拼进来
+      if (isUserSpeaker(speaker) && uploadedKeywordRe.test(text)) {
+        // 清掉“已上传:”前缀
+        let cleaned = text.replace(uploadedKeywordRe, '').trim();
+
+        if (!cleaned) {
+          const next = (lines[i + 1] || '').trim();
+          // next 不是下一条带时间戳的消息，且不是 URL/大小
+          if (next && !next.match(lineRe) && !next.toLowerCase().startsWith('url:') && !next.startsWith('大小：') && !next.toLowerCase().startsWith('size:')) {
+            cleaned = next;
+          } else {
+            cleaned = '[附件]';
+          }
+        }
+        text = `[已上传] ${cleaned}`.trim();
+      }
+
       events.push({ tSec, speaker, text });
     }
 
@@ -234,52 +264,49 @@ document.addEventListener('DOMContentLoaded', function () {
     return events;
   }
 
-  // 只统计：用户发言 -> 下一条专员回复（客服先开场白不算）
-// 口径：用户每条消息都算一轮（不合并连发）
-// 规则：每条用户消息都入队，遇到第一条专员回复就结算“最早那条用户消息”
-function calcAvgAgentResponseSeconds(events) {
-  // 1) 找到“专员已接入”的标记：第一条【非用户 + 非系统】消息（一般就是开场白）
-  const firstAgentIdx = events.findIndex(ev => {
-    const speaker = ev.speaker;
-    if (isSystemOrBotSpeaker(speaker)) return false; // CrabX 系统不算
-    if (isUserSpeaker(speaker)) return false;        // 用户不算
-    return true;                                     // 其他都当专员（Lisa/Peter/Agent名）
-  });
-
-  // 如果整段里都没找到专员消息，就无法计算
-  if (firstAgentIdx === -1) return { avgSec: null, rounds: 0 };
-
-  // 2) 从专员开场白之后开始统计
-  let waitingUserTime = null; // 注意：我们要“用户连发取第一条”，所以只在 null 时赋值
-  const durations = [];
-
-  for (let i = firstAgentIdx + 1; i < events.length; i++) {
-    const ev = events[i];
-    const speaker = ev.speaker;
-
-    // 跳过系统
-    if (isSystemOrBotSpeaker(speaker)) continue;
-
-    if (isUserSpeaker(speaker)) {
-      // 用户连发：只记录第一条，不覆盖
-      if (waitingUserTime === null) waitingUserTime = ev.tSec;
-      continue;
+  // ✅ 找到“转接提示”在 events 里的位置（取最后一次）
+  function findTransferIndex(events) {
+    let idx = -1;
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i];
+      if (isSystemOrBotSpeaker(ev.speaker) && isTransferText(ev.text)) idx = i;
     }
-
-    // 专员消息：如果前面有用户在等，就结算一轮
-    if (waitingUserTime !== null) {
-      const d = ev.tSec - waitingUserTime;
-      if (d >= 0) durations.push(d);
-      waitingUserTime = null; // 清空，等待下一轮用户
-    } else {
-      // 专员自己连发且用户没说话：不算
-    }
+    return idx;
   }
 
-  if (durations.length === 0) return { avgSec: null, rounds: 0 };
-  const sum = durations.reduce((a, b) => a + b, 0);
-  return { avgSec: sum / durations.length, rounds: durations.length };
-}
+  // ✅ 修正：从“转接提示”之后开始统计；如果没找到转接提示，退回从头统计
+  function calcAvgAgentResponseSeconds(events) {
+    const durations = [];
+    const transferIdx = findTransferIndex(events);
+    const startIdx = transferIdx >= 0 ? transferIdx + 1 : 0;
+
+    let waitingUserTime = null;
+
+    for (let i = startIdx; i < events.length; i++) {
+      const ev = events[i];
+      const speaker = ev.speaker;
+
+      // 跳过系统（CrabX）
+      if (isSystemOrBotSpeaker(speaker)) continue;
+
+      if (isUserSpeaker(speaker)) {
+        // 用户连发：只记录第一条，不覆盖（包含已上传）
+        if (waitingUserTime === null) waitingUserTime = ev.tSec;
+        continue;
+      }
+
+      // 专员消息：如果前面有用户在等，就结算一轮
+      if (waitingUserTime !== null) {
+        const d = ev.tSec - waitingUserTime;
+        if (d >= 0) durations.push(d);
+        waitingUserTime = null;
+      }
+    }
+
+    if (durations.length === 0) return { avgSec: null, rounds: 0 };
+    const sum = durations.reduce((a, b) => a + b, 0);
+    return { avgSec: sum / durations.length, rounds: durations.length };
+  }
 
   function showMetrics(avgSec, rounds) {
     if (!metricsBox || !avgAgentReply || !validRounds) return;
@@ -355,7 +382,7 @@ function calcAvgAgentResponseSeconds(events) {
         const { avgSec, rounds } = calcAvgAgentResponseSeconds(events);
         showMetrics(avgSec, rounds);
 
-        // ===== 渲染聊天 =====
+        // ===== 渲染聊天（保持你的原逻辑，不影响统计）=====
         const lines = fullText.split('\n');
         let currentMessage = '';
 
@@ -369,7 +396,7 @@ function calcAvgAgentResponseSeconds(events) {
             return;
           }
 
-          if (t.startsWith('URL:') || t.startsWith('类型：') || t.startsWith('Size:')) return;
+          if (t.startsWith('URL:') || t.startsWith('类型：') || t.startsWith('Size:') || t.startsWith('大小：')) return;
 
           if (t.match(messageStartPattern)) {
             if (currentMessage.length > 0) renderText(currentMessage, 'message');
@@ -378,12 +405,6 @@ function calcAvgAgentResponseSeconds(events) {
             if (currentMessage.length > 0) renderText(currentMessage, 'message');
             renderText(t, 'system');
             currentMessage = '';
-          } else if (t.match(attachmentLinePattern)) {
-            const filenameMatch = t.match(attachmentLinePattern);
-            if (filenameMatch && filenameMatch[2]) {
-              const filename = filenameMatch[2].trim() + '.png';
-              renderText(filename, 'attachment');
-            }
           } else {
             currentMessage += '\n' + t;
           }
@@ -410,7 +431,6 @@ function calcAvgAgentResponseSeconds(events) {
     }
   }
 
-  // bind
   fetchButton.addEventListener('click', fetchChatRecords);
   ticketIdInput.addEventListener('keypress', (event) => {
     if (event.key === 'Enter') {
